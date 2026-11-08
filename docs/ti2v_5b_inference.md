@@ -1,6 +1,6 @@
 # Wan2.2 TI2V-5B 推理范围与 Pipeline
 
-本文划定当前仓库里 **TI2V-5B**（`Wan2.2-TI2V-5B`，任务名 `ti2v-5B`）的推理实现边界，并按真实调用顺序说明 pipeline，以及这条链路上实际用到的优化。多卡切分见 [TI2V-5B 推理侧并行方式](ti2v_5b_parallelism.md)。论文推理侧的二维上下文并行、diffusion cache、FP8 GEMM 和 8-bit FlashAttention 没有进入本仓库，对照放在 [docs/problems](problems/)。范围按「最小可运行的文生视频推理」来划：单次生成一条视频，不包含服务化、作业调度和 A14B / S2V / Animate。
+本文划定当前仓库里 **TI2V-5B**（`Wan2.2-TI2V-5B`，任务名 `ti2v-5B`）的推理实现边界，并按真实调用顺序说明 pipeline，以及这条链路上实际用到的优化。算子种类、调用次数和计算图的定义见 [TI2V-5B 的算子与计算图](ti2v_5b_operators.md)。多卡切分见 [TI2V-5B 推理侧并行方式](ti2v_5b_parallelism.md)。论文推理侧的二维上下文并行、diffusion cache、FP8 GEMM 和 8-bit FlashAttention 没有进入本仓库，对照放在 [docs/problems](problems/)。范围按「最小可运行的文生视频推理」来划：单次生成一条视频，不包含服务化、作业调度和 A14B / S2V / Animate。
 
 对应课题里的第一步：先认清推理过程中的主要算子、计算、访存和并行特征，再谈 SME ARM 众核上的适配。本文描述的是 **GPU 参考实现**，不是 ARM 实现。
 
@@ -145,7 +145,7 @@ DiT 前向次数 = sample_steps × 2 = 50 × 2 = 100
 层数 = 30
 ```
 
-因此热路径是 **100 × 30 层 DiT block**，不是 T5，也不是 VAE。T5 每个请求 2 次，VAE 解码每个请求 1 次。本仓库不跳过采样步，也不把 GEMM 或注意力降到 FP8 / Int8，所以上面的次数就是实际计算量。
+因此热路径是 **100 × 30 层 DiT block**，不是 T5，也不是 VAE。T5 每个请求 2 次，VAE 解码每个请求 1 次。本仓库不跳过采样步，也不把 GEMM 或注意力降到 FP8 / Int8，所以上面的次数就是实际计算量。这些次数对应哪些算子、外层循环和 `WanModel.forward` 如何连成计算图，见 [TI2V-5B 的算子与计算图](ti2v_5b_operators.md)。
 
 图生视频的空间尺寸不直接用 `--size` 的宽高，而是用 `max_area = 704×1280`，再由 `best_output_size` 把宽高对齐到 32 的倍数（`patch_size` 的空间维 × `vae_stride` 的空间维 = 32），并尽量保持原图宽高比。帧数公式与文生视频相同。
 
@@ -272,7 +272,7 @@ DiT 内部还会把这段向量线性投到 3072，并在长度维补零到 512�
 
 ### 5.7 DiT 一次前向
 
-实现是 `wan/modules/model.py` 的 `WanModel.forward`。TI2V 不走 `model_type == 'i2v'` 的 `y` 通道拼接，图像条件已经写在 latent 和 timestep 里。
+实现是 `wan/modules/model.py` 的 `WanModel.forward`。TI2V 不走 `model_type == 'i2v'` 的 `y` 通道拼接，图像条件已经写在 latent 和 timestep 里。这一次前向里每个子模块执行几次，见 [TI2V-5B 的算子与计算图](ti2v_5b_operators.md) 第 3.1 节。
 
 1. **Patch 嵌入**：`Conv3d(in_dim → 3072, kernel=stride=(1,2,2))`。输出展成 `[1, 27280, 3072]`，不足 `seq_len` 的位置补 0。同时记下网格 `(F, H, W) = (31, 22, 40)`。
 2. **时间嵌入**：正弦编码到 256 维，两层 MLP（Linear + SiLU + Linear）得到 3072 维，再投影成 6 组调制向量。这一段强制 fp32。调制是 **按 token** 的，形状 `[1, seq_len, 6, 3072]`。
@@ -305,7 +305,7 @@ RoPE 把 head 维 128 拆成三段频率，分别作用在时间、高、宽网�
 
 `WanVAE_.decode`：按 latent 的时间维 **逐帧** 调用 `Decoder3d`，帧间依赖同一份 cache，最后 `unpatchify`。默认 31 个 latent 帧就是 31 次串行解码调用。
 
-`CausalConv3d` 把时间 padding 全部放在过去一侧，前向时如果有 cache 就拼到时间维前面再做普通 `Conv3d`。这是 VAE 里数量最多的算子，也是时间维上的串行点。多卡不把这 31 次解码拆开：decode 只在 rank 0 上按时间顺序跑完。
+`CausalConv3d` 把时间 padding 全部放在过去一侧，前向时如果有 cache 就拼到时间维前面再做普通 `Conv3d`。这是 VAE 里数量最多的算子，也是时间维上的串行点。解码器中部还有一块单头空间注意力，用的是 `scaled_dot_product_attention`，与 DiT 的 FlashAttention 不是同一次调用。算子清单见 [TI2V-5B 的算子与计算图](ti2v_5b_operators.md) 第 3.3 节。多卡不把这 31 次解码拆开：decode 只在 rank 0 上按时间顺序跑完。
 
 ### 5.9 写视频
 
@@ -336,11 +336,11 @@ VAE 的 `feat_cache` 只在一次解码内部记住上一时间块，不是 diff
 
 ## 6. 算子、访存与并行特征
 
-给课题中「识别算子兼容性与性能瓶颈」用的对照。热度按默认 100 次 DiT 前向估计，形状按单卡。Ulysses 打开后，自注意力和 RoPE 的序列维按第 4 节的 8 卡例子切开，调用顺序见第 5.3 节。
+给课题中「识别算子兼容性与性能瓶颈」用的对照。算子从哪段 `forward` 来、各执行多少次，见 [TI2V-5B 的算子与计算图](ti2v_5b_operators.md)。热度按默认 100 次 DiT 前向估计，形状按单卡。Ulysses 打开后，自注意力和 RoPE 的序列维按第 4 节的 8 卡例子切开，调用顺序见第 5.3 节。
 
 | 算子 | 出现位置 | 主要形状 | 重复次数 | 访存与并行 |
 | --- | --- | --- | --- | --- |
-| Linear / GEMM | DiT 的 QKV、输出投影、FFN、文本与时间 MLP；T5 的 QKV 与 FFN | DiT FFN 为 `27280 × 3072` 与 `27280 × 14336`，bf16 | 每个 DiT 层 7 个左右 Linear，×30 ×100 | 计算密度最高。当前是 bf16 的 `nn.Linear`，不是论文的 FP8 GEMM。见第 5.10 节 |
+| Linear / GEMM | DiT 的 QKV、输出投影、FFN、文本与时间 MLP；T5 的 QKV 与 FFN | DiT FFN 为 `27280 × 3072` 与 `27280 × 14336`，bf16 | 每层 10 个 Linear，×30 ×100；另加每次前向的时间嵌入 3、文本嵌入 2、Head 1。见 [算子与计算图](ti2v_5b_operators.md) | 计算密度最高。当前是 bf16 的 `nn.Linear`，不是论文的 FP8 GEMM。见第 5.10 节 |
 | 全局自注意力 | DiT `WanSelfAttention` | Q/K/V `[1, 27280, 24, 128]`，bf16 | 30 × 100 | 序列平方项。绑定 FlashAttention 2 或 3，输入收成 bf16，不是混合 8-bit。Ulysses 打开后的切分见第 5.3 节 |
 | 交叉注意力 | DiT `WanCrossAttention` | query 27280，key/value ≤ 512，24 × 128 | 30 × 100 | 比自注意力短一截（乘的是文本长度）。仍然是 GEMM + softmax |
 | RMSNorm / LayerNorm | DiT 每层 3 处，另加 Q/K RMSNorm；调制前后有 fp32 cast | 归约轴是 3072 | 与层数同量级 | 带宽敏感，归约在通道维。代码里先 `.float()` 再算，再 cast 回 bf16，会多一轮读写 |
@@ -387,7 +387,7 @@ dtype 混用会直接影响内存流量：DiT 与 T5 参数是 bf16，时间调�
 
 1. `wan/configs/wan_ti2v_5B.py` 与 `wan/configs/shared_config.py`：把形状和默认步数固定下来。
 2. `wan/textimage2video.py` 的 `t2v()`：整条 pipeline 的控制流都在这一个函数里。其中的 σ、速度和积分见 [Wan2.2 中的 Rectified Flow](wan22_rectified_flow.md)。
-3. `wan/modules/model.py` 的 `WanModel.forward` 与 `WanAttentionBlock`：热路径算子。
+3. `wan/modules/model.py` 的 `WanModel.forward` 与 `WanAttentionBlock`：热路径算子。算子次数和计算图见 [TI2V-5B 的算子与计算图](ti2v_5b_operators.md)。
 4. 本文第 5.10 节：这条链路用上了哪些优化，论文里的哪几项没有接上。Prompt 改写见 [TI2V-5B 的 Prompt 改写](ti2v_prompt_alignment.md)。没接上的三项在 [docs/problems](problems/)。
 5. 多卡：本文第 5.3 节，以及 [TI2V-5B 推理侧并行方式](ti2v_5b_parallelism.md)。对照 `WanTI2V._configure_model`、`wan/distributed/fsdp.py` 和 `wan/distributed/sequence_parallel.py`。
 6. `wan/modules/attention.py`：CUDA 绑定点。精度停在 bf16。
