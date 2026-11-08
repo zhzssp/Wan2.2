@@ -18,7 +18,7 @@ TI2V-5B 在本仓库中是一条 **单进程、单次请求** 的推理链路，
 - VAE 使用 `wan/modules/vae2_2.py` 的 `Wan2_2_VAE`，压缩步长是时间 4、空间 16（`vae_stride = (4, 16, 16)`），latent 通道 `z_dim = 48`。
 - 权重用 `WanModel.from_pretrained(checkpoint_dir)` 从检查点根目录加载，不进子目录。
 
-仓库里没有常驻服务、请求队列、Slurm 脚本，也没有 SME / ARM 后端。这条链路里真正改变计算或显存的手段是：单卡上的 CPU offload 与 bfloat16，多卡上可选的 FSDP（切参数）和一维 Ulysses（切序列）。精度停在 bf16 的 GEMM 和 FlashAttention；50 步里条件前向和无条件前向都不跳过。汇总见第 5.10 节。
+仓库里没有常驻服务、请求队列、Slurm 脚本，也没有 SME / ARM 后端。这条链路里真正改变计算或显存的手段是：单卡上的 CPU offload 与 bfloat16，多卡上可选的 FSDP（切参数）和一维 Ulysses（切序列）。精度停在 bf16 的 GEMM 和 FlashAttention；50 步里条件前向和无条件前向都不跳过。可选的 prompt 改写只换送进 umT5 的正向字符串，不改变这 100 次前向，见 [TI2V-5B 的 Prompt 改写](ti2v_prompt_alignment.md)。汇总见第 5.10 节。
 
 多卡两项默认都关闭，共用同一个 NCCL 进程组，作用在同一次生成上，不增加采样步，也不把 batch 拆开。最小实现可以整段不走。切分粒度见 [TI2V-5B 推理侧并行方式](ti2v_5b_parallelism.md)，进入 pipeline 的位置见第 5.3 节。
 
@@ -54,7 +54,7 @@ TI2V-5B 在本仓库中是一条 **单进程、单次请求** 的推理链路，
 | `wan/distributed/ulysses.py` | 仅 `--ulysses_size > 1` 时替换注意力 |
 | `wan/distributed/sequence_parallel.py` | 同上，替换 DiT `forward`，按序列维切分 |
 | `wan/distributed/util.py` | 进程组与 all-to-all |
-| `wan/utils/prompt_extend.py` | `--use_prompt_extend` 才调用 Qwen 或 DashScope，发生在视频模型之前 |
+| `wan/utils/prompt_extend.py`、`wan/utils/system_prompt.py` | `--use_prompt_extend` 才在采样前改写正向 prompt。见 [TI2V-5B 的 Prompt 改写](ti2v_prompt_alignment.md) |
 
 这些文件在单卡最小路径上不会被调用。多卡时它们不改变第 5 节的采样循环：FSDP 在 `WanTI2V` 构造时按 block 切参数，Ulysses 在进循环前替换 DiT 的 `forward` 和每层自注意力。`--ulysses_size` 必须等于 `WORLD_SIZE`，且 `num_heads = 24` 必须能被卡数整除。这是 GPU 多卡策略，与 ARM 众核上要新做的线程并行是两件事。用法见 [TI2V-5B 推理侧并行方式](ti2v_5b_parallelism.md)。
 
@@ -155,7 +155,10 @@ DiT 前向次数 = sample_steps × 2 = 50 × 2 = 100
 
 ```mermaid
 flowchart TD
-    A["generate.py<br/>task = ti2v-5B"] --> B["WanTI2V 构造<br/>加载 T5、VAE、一份 DiT<br/>可选：FSDP 切参数，Ulysses 替换 forward"]
+    A["generate.py<br/>task = ti2v-5B"] --> P{"打开 prompt 改写?"}
+    P -->|否| B["WanTI2V 构造<br/>加载 T5、VAE、一份 DiT<br/>可选：FSDP 切参数，Ulysses 替换 forward"]
+    P -->|是| R["rank 0：Qwen 改写正向 prompt<br/>失败则退回原文"]
+    R --> B
     B --> C{"是否传入图像"}
     C -->|否| D["t2v: 直接采样高斯噪声 latent"]
     C -->|是| E["i2v: 图像对齐、VAE 编码<br/>锁住第 0 帧 latent"]
@@ -173,6 +176,8 @@ flowchart TD
 ```
 
 `generate()` 只做分发：有 `img` 走 `i2v()`，否则走 `t2v()`。两条路径的去噪循环同构，差别在 latent 初始化和第 0 帧是否被条件钉死。循环是 rectified flow 采样：DiT 预测速度，调度器把 σ 从高噪声积到 0。路径、换算和积分见 [Wan2.2 中的 Rectified Flow](wan22_rectified_flow.md)。
+
+默认不改写 prompt，节点 P 直接进入构造。打开 `--use_prompt_extend` 时，节点 R 只替换正向字符串，负向 prompt 和后面的 50 步不变。改写模型、系统提示词和与论文三条原则的差别见 [TI2V-5B 的 Prompt 改写](ti2v_prompt_alignment.md)。
 
 多卡不给这张图增加节点。FSDP 和 Ulysses 发生在节点 B 的构造，以及节点 H、I 每一次 DiT 前向的内部。从 G 到 K 的 50 步、每步两次前向，卡数变了也不变。见第 5.3 节。
 
@@ -220,7 +225,7 @@ python generate.py --task ti2v-5B --size 1280*704 \
 
 ### 5.4 文本条件
 
-每个请求编码两次：用户 prompt，以及负向 prompt。负向 prompt 为空时使用 `shared_config.py` 里的中文默认串。
+每个请求编码两次：正向 prompt，以及负向 prompt。负向 prompt 为空时使用 `shared_config.py` 里的中文默认串，不参与改写。正向 prompt 默认就是用户原文；只有打开 `--use_prompt_extend` 时，这里拿到的才是第 5.1 节节点 R 改写后的字符串。见 [TI2V-5B 的 Prompt 改写](ti2v_prompt_alignment.md)。
 
 `T5EncoderModel.__call__`：
 
@@ -308,10 +313,11 @@ RoPE 把 head 维 128 拆成三段频率，分别作用在时间、高、宽网�
 
 ### 5.10 这条链路实际用上的优化
 
-按第 5.1–5.9 节的调用顺序，本仓库真正改变显存或内核的手段只有下表这些。论文推理侧另外三项没有接进 `WanTI2V`，所以默认 100 次 DiT 前向、每次 30 层全量 block，就是这条链路的计算量。
+按第 5.1–5.9 节的调用顺序，可选优化如下。Prompt 改写只换正向文本；后面几行才改变显存或内核。论文推理侧另外三项没有接进 `WanTI2V`，所以默认仍是 100 次 DiT 前向、每次 30 层全量 block。
 
 | 手段 | 出现位置 | 实际作用 |
 | --- | --- | --- |
+| Prompt 改写 | `generate.py`，`--use_prompt_extend`，默认关，在构造 `WanTI2V` 之前 | 只替换正向 prompt。不减少 100 次前向。见 [TI2V-5B 的 Prompt 改写](ti2v_prompt_alignment.md) |
 | `--offload_model`、`--t5_cpu`、`--convert_model_dtype` | 单卡构造与采样前后搬权重。多进程默认不 offload | 省显存。不减少前向次数，也不改算子种类 |
 | bfloat16 autocast | `t2v()` / `i2v()` 包住整个去噪循环 | DiT 的 `nn.Linear` 按 bf16 做 GEMM。调制、若干残差和 VAE 仍偏 fp32 |
 | FlashAttention 2 或 3 | 每层自注意力和交叉注意力，`wan/modules/attention.py` | Q、K、V 收成 bf16 后调用现成的 `flash_attn_varlen_func` |
@@ -382,7 +388,7 @@ dtype 混用会直接影响内存流量：DiT 与 T5 参数是 bf16，时间调�
 1. `wan/configs/wan_ti2v_5B.py` 与 `wan/configs/shared_config.py`：把形状和默认步数固定下来。
 2. `wan/textimage2video.py` 的 `t2v()`：整条 pipeline 的控制流都在这一个函数里。其中的 σ、速度和积分见 [Wan2.2 中的 Rectified Flow](wan22_rectified_flow.md)。
 3. `wan/modules/model.py` 的 `WanModel.forward` 与 `WanAttentionBlock`：热路径算子。
-4. 本文第 5.10 节：这条链路用上了哪些优化，论文里的哪几项没有接上。细节在 [docs/problems](problems/)。
+4. 本文第 5.10 节：这条链路用上了哪些优化，论文里的哪几项没有接上。Prompt 改写见 [TI2V-5B 的 Prompt 改写](ti2v_prompt_alignment.md)。没接上的三项在 [docs/problems](problems/)。
 5. 多卡：本文第 5.3 节，以及 [TI2V-5B 推理侧并行方式](ti2v_5b_parallelism.md)。对照 `WanTI2V._configure_model`、`wan/distributed/fsdp.py` 和 `wan/distributed/sequence_parallel.py`。
 6. `wan/modules/attention.py`：CUDA 绑定点。精度停在 bf16。
 7. `wan/modules/t5.py` 的 `T5EncoderModel` 与 `T5Attention`：短序列参照实现。
