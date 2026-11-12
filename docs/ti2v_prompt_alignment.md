@@ -1,6 +1,6 @@
 # TI2V-5B 的 Prompt 改写
 
-本文说明当前仓库里 **TI2V-5B** 如何实现论文 4.5 的推理侧 prompt alignment。Pipeline 里它出现在哪一步，见 [TI2V-5B 推理范围与 Pipeline](ti2v_5b_inference.md) 第 5.2 节和第 5.4 节。
+本文说明当前仓库里 **TI2V-5B** 如何实现论文 4.5 的推理侧 prompt alignment。Pipeline 里它出现在哪一步，见 [TI2V-5B 推理范围与 Pipeline](ti2v_5b_inference.md) 第 5.1 节和第 5.2 节。
 
 论文把对齐分成两步。第一步在训练：每条图像或视频配上长短、文风不同的多条字幕。本仓库只有推理，没有这一步。第二步在推理：用大语言模型把用户往往很短的 prompt 改写成更接近训练字幕的分布。代码里的名字是 **prompt extend**，开关是 `--use_prompt_extend`，默认关闭。
 

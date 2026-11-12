@@ -1,6 +1,6 @@
 # Wan2.2 TI2V-5B 推理侧并行方式
 
-本文只记录当前仓库里 **TI2V-5B**（任务名 `ti2v-5B`，管道 `wan/textimage2video.py` 的 `WanTI2V`）推理实际用到的并行，以及每一种是怎么挂到一次生成上的。Pipeline、张量形状和采样公式见 [TI2V-5B 推理范围与 Pipeline](ti2v_5b_inference.md)。它们在调用顺序中的位置是该文第 5.3 节。
+本文只记录当前仓库里 **TI2V-5B**（任务名 `ti2v-5B`，管道 `wan/textimage2video.py` 的 `WanTI2V`）推理实际用到的并行，以及每一种是怎么挂到一次生成上的。Pipeline、张量形状和采样公式见 [TI2V-5B 推理范围与 Pipeline](ti2v_5b_inference.md)。它们在调用顺序中的位置是该文第 7 节。
 
 范围是 `generate.py` 拉起的这一次视频生成。单卡 kernel 内部的线程并行（cuBLAS、FlashAttention 在一张 GPU 上的实现）不在这里展开。
 
