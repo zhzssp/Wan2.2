@@ -314,6 +314,7 @@ def _init_logging(rank):
 
 def generate(args):
     rank = int(os.getenv("RANK", 0))
+    # 就是进程数，world是参与通信的进程集合
     world_size = int(os.getenv("WORLD_SIZE", 1))
     local_rank = int(os.getenv("LOCAL_RANK", 0))
     device = local_rank
@@ -341,7 +342,7 @@ def generate(args):
     if args.ulysses_size > 1:
         assert args.ulysses_size == world_size, f"The number of ulysses_size should be equal to the world size."
         init_distributed_group()
-
+    # 使用LLM将prompt进行扩充，使得输入更接近训练数据（论文中有提到这个技术）
     if args.use_prompt_extend:
         if args.prompt_extend_method == "dashscope":
             prompt_expander = DashScopePromptExpander(
@@ -425,8 +426,10 @@ def generate(args):
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
             offload_model=args.offload_model)
+    # TI2V核心pipeline
     elif "ti2v" in args.task:
         logging.info("Creating WanTI2V pipeline.")
+        # 初始化模型
         wan_ti2v = wan.WanTI2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
@@ -440,6 +443,7 @@ def generate(args):
         )
 
         logging.info(f"Generating video ...")
+        # 推理
         video = wan_ti2v.generate(
             args.prompt,
             img=img,

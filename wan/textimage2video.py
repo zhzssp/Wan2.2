@@ -85,6 +85,7 @@ class WanTI2V:
             self.init_on_cpu = False
 
         shard_fn = partial(shard_model, device_id=device_id)
+        # 构造的时候直接放到CPU上
         self.text_encoder = T5EncoderModel(
             text_len=config.text_len,
             dtype=config.t5_dtype,
@@ -101,6 +102,7 @@ class WanTI2V:
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         self.model = WanModel.from_pretrained(checkpoint_dir)
+        # 并行开关
         self.model = self._configure_model(
             model=self.model,
             use_sp=use_sp,
@@ -307,7 +309,7 @@ class WanTI2V:
             context_null = self.text_encoder([n_prompt], torch.device('cpu'))
             context = [t.to(self.device) for t in context]
             context_null = [t.to(self.device) for t in context_null]
-
+        # 用于去噪的初始随机噪声
         noise = [
             torch.randn(
                 target_shape[0],
@@ -364,6 +366,7 @@ class WanTI2V:
                 self.model.to(self.device)
                 torch.cuda.empty_cache()
 
+            # 去噪循环
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
                 timestep = [t]
@@ -385,6 +388,7 @@ class WanTI2V:
                 noise_pred = noise_pred_uncond + guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
 
+                # 其中包含了rectified flow的速度积分
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),
                     t,

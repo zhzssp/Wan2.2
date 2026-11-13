@@ -1,14 +1,10 @@
 # Wan2.2 TI2V-5B 推理范围与 Pipeline
 
-本文划定当前仓库里 **TI2V-5B**（`Wan2.2-TI2V-5B`，任务名 `ti2v-5B`）的推理实现边界。前半部分写与卡数无关的内容：文件范围、权重、张量规模、算子，以及两条链路共用的计算。后半部分把具体推理 pipeline 分成两条线：单卡，以及这次实测的 8 卡。每条线按构造、文本编码、去噪、解码、写盘走一遍，并记下这条线上的显存、性质和问题。
-
-算子种类、调用次数和计算图的定义见 [TI2V-5B 的算子与计算图](ti2v_5b_operators.md)。多卡切分的通信细节见 [TI2V-5B 推理侧并行方式](ti2v_5b_parallelism.md)。论文推理侧的二维上下文并行、diffusion cache、FP8 GEMM 和 8-bit FlashAttention 没有进入本仓库，对照放在 [docs/problems](problems/)。范围按「最小可运行的文生视频推理」来划：单次生成一条视频，不包含服务化、作业调度和 A14B / S2V / Animate。
-
-对应课题里的第一步：先认清推理过程中的主要算子、计算、访存和并行特征，再谈 SME ARM 众核上的适配。本文描述的是 **GPU 参考实现**，不是 ARM 实现。
+算子种类、调用次数和计算图的定义见 [TI2V-5B 的算子与计算图](ti2v_5b_operators.md)。多卡切分的通信细节见 [TI2V-5B 推理侧并行方式](ti2v_5b_parallelism.md)。论文推理侧的二维上下文并行、diffusion cache、FP8 GEMM 和 8-bit FlashAttention 没有进入本仓库，相关文档放在 [docs/problems](problems/)。
 
 ## 1. 范围结论
 
-TI2V-5B 在本仓库中是一条 **单进程或一组进程、单次请求** 的推理链路，由三个模型串起来：
+TI2V-5B 在本仓库中是一条 **单进程/一组进程 + 单次请求** 的推理链路，由三个模型串起来：
 
 1. **umT5-XXL 编码器**：每个请求跑 2 次（正向 prompt 与负向 prompt），得到文本条件。
 2. **Wan DiT（约 5B，单份权重）**：去噪循环的主体。默认 50 步、classifier-free guidance，每步 2 次前向，共约 100 次 DiT 前向。
